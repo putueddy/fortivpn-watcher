@@ -51,6 +51,9 @@ type VPNWatcher struct {
 	TelegramChatID  string
 	TelegramEnabled bool
 
+	// teams
+	TeamsWebhookURL string // Microsoft Teams Workflow trigger URL
+
 	// autoreconnect
 	AutoReconnect bool
 	ReconnectCmd  string
@@ -167,16 +170,18 @@ func (w *VPNWatcher) evaluateAndAct() {
 			"last_change": w.lastChange.Format(time.RFC3339Nano),
 		})
 
-		// Telegram notify
+		// Telegram notify (cooldown)
 		if newConnected {
 			w.notify("up", "✅ *FortiVPN Connected* — target reachable")
 		} else {
 			w.notify("down", "❌ *FortiVPN Disconnected* — link or reachability lost")
 		}
 
+		// Teams Adaptive Card (tanpa cooldown)
+		w.notifyTeamsAdaptive(newConnected, "")
+
 		// One-shot AutoReconnect: trigger only on transition Connected -> Disconnected
 		if w.AutoReconnect && !newConnected {
-			// was previous connected? yes, because changed=true and newConnected=false
 			go w.tryAutoReconnectOnce()
 		}
 	}
@@ -212,17 +217,6 @@ func (w *VPNWatcher) evaluateCore() (changed bool, newConnected, ifPresent, ifUp
 
 /* =========  AUTORECONNECT (ONE-SHOT)  ========= */
 
-// notify bypass cooldown (khusus untuk autoreconnect UP)
-func (w *VPNWatcher) notifyBypassCooldown(kind, text string) {
-	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
-		return
-	}
-	w.lastNotif[kind] = time.Now() // langsung update timestamp
-	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
-		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
-	}
-}
-
 func (w *VPNWatcher) tryAutoReconnectOnce() {
 	if w.ReconnectCmd == "" {
 		return
@@ -246,17 +240,18 @@ func (w *VPNWatcher) tryAutoReconnectOnce() {
 
 	// recheck after delay
 	time.Sleep(w.RecheckDelay)
-	changed, connected, _, _, _, _ := w.evaluateCore()
+	_, connected, _, _, _, _ := w.evaluateCore()
 	jsonLog("info", "AutoReconnect recheck", map[string]any{
-		"status_changed": changed,
-		"connected":      connected,
+		"connected": connected,
 	})
+
 	if connected {
 		// bypass cooldown agar notif UP tidak ditahan
 		w.notifyBypassCooldown("up", "✅ *FortiVPN Connected* — auto-reconnect succeeded")
 		jsonLog("info", "AutoReconnect success, UP notification sent (bypass cooldown)", nil)
+		// kirim juga Teams Adaptive Card dengan pesan custom
+		w.notifyTeamsAdaptive(true, "auto-reconnect succeeded")
 	}
-
 }
 
 /* =========  CHECKERS  ========= */
@@ -309,6 +304,17 @@ func (w *VPNWatcher) notify(kind, text string) {
 	}
 }
 
+// notify bypass cooldown (khusus untuk autoreconnect UP)
+func (w *VPNWatcher) notifyBypassCooldown(kind, text string) {
+	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
+		return
+	}
+	w.lastNotif[kind] = time.Now() // set timestamp agar tetap terlacak
+	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
+		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
+	}
+}
+
 func sendTelegram(token, chatID, text string, markdown bool) error {
 	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	// compact + escape
@@ -338,20 +344,63 @@ func sendTelegram(token, chatID, text string, markdown bool) error {
 	return nil
 }
 
-func urlQueryEscape(s string) string {
-	// minimal escaping for form body
-	replacer := strings.NewReplacer(
-		"%", "%25",
-		"&", "%26",
-		"+", "%2B",
-		"=", "%3D",
-		"\n", "%0A",
-	)
-	return replacer.Replace(s)
+/* =========  TEAMS (ADAPTIVE CARD via Workflow URL)  ========= */
+
+func (w *VPNWatcher) notifyTeamsAdaptive(connected bool, customMessage string) {
+	if w.TeamsWebhookURL == "" {
+		return
+	}
+	status := "DOWN"
+	if connected {
+		status = "UP"
+	}
+	sendTeamsAdaptiveCard(w.TeamsWebhookURL, status, time.Now().Format(time.RFC3339), customMessage)
 }
-func compactWhitespace(s string) string {
-	re := regexp.MustCompile(`[ \t\r\n]+`)
-	return re.ReplaceAllString(strings.TrimSpace(s), " ")
+
+func sendTeamsAdaptiveCard(webhook, status, timestamp, customMessage string) {
+	// Build Adaptive Card with A + C choices
+	title := "🔥 FortiVPN Disconnected — link or reachability lost"
+	color := "Attention"
+	if status == "UP" {
+		title = "✅ FortiVPN Connected  — target reachable"
+		if customMessage != "" {
+			title = "✅ FortiVPN Connected — " + customMessage
+		}
+		color = "Good"
+	}
+	card := fmt.Sprintf(`{
+		"type": "AdaptiveCard",
+		"version": "1.4",
+		"body": [
+			{
+				"type": "TextBlock",
+				"text": "%s",
+				"size": "Large",
+				"weight": "Bolder",
+				"color": "%s"
+			},
+			{
+				"type": "TextBlock",
+				"text": "**Status:** %s",
+				"wrap": true
+			},
+			{
+				"type": "TextBlock",
+				"text": "**Time:** %s",
+				"wrap": true
+			}
+		]
+	}`, title, color, status, timestamp)
+
+	req, _ := http.NewRequest("POST", webhook, strings.NewReader(card))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		jsonLog("error", "Teams notify failed", map[string]any{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	jsonLog("info", "Teams alert sent", map[string]any{"status": status, "code": resp.StatusCode})
 }
 
 /* =========  HTTP  ========= */
@@ -369,7 +418,7 @@ func statusHandler(watcher *VPNWatcher) http.HandlerFunc {
 	}
 }
 
-// Force check: minimal output per request Mas Putu
+// Force check: minimal output
 func forceCheckHandler(watcher *VPNWatcher) http.HandlerFunc {
 	type resp struct {
 		Forced    bool `json:"forced"`
@@ -436,6 +485,7 @@ func main() {
 	tgChatID := os.Getenv("TELEGRAM_CHAT_ID")
 	autoReconnect := strings.ToLower(getenv("FVPN_AUTORECONNECT", "false")) == "true"
 	reconnectCmd := getenv("FVPN_RECONNECT_CMD", "")
+	teamsWebhook := os.Getenv("MS_TEAMS_WEBHOOK_URL")
 
 	w := NewVPNWatcher(ifName, target, interval)
 	w.PingTimeoutSec = pingTimeout
@@ -446,6 +496,7 @@ func main() {
 	w.TelegramEnabled = tgToken != "" && tgChatID != ""
 	w.AutoReconnect = autoReconnect
 	w.ReconnectCmd = reconnectCmd
+	w.TeamsWebhookURL = teamsWebhook
 
 	go w.Start()
 
@@ -473,6 +524,8 @@ func main() {
 		"autoreconnect":   autoReconnect,
 		"reconnect_cmd":   reconnectCmd,
 		"recheck_delay":   recheckDelay.String(),
+		"teams_webhook":   teamsWebhook != "",
+		"telegram":        w.TelegramEnabled,
 	})
 
 	// graceful shutdown
@@ -535,4 +588,20 @@ func getenvInt(key string, def int) int {
 		jsonLog("warn", "invalid int env, using default", map[string]any{key: v, "default": def})
 	}
 	return def
+}
+
+func urlQueryEscape(s string) string {
+	// minimal escaping for form body
+	replacer := strings.NewReplacer(
+		"%", "%25",
+		"&", "%26",
+		"+", "%2B",
+		"=", "%3D",
+		"\n", "%0A",
+	)
+	return replacer.Replace(s)
+}
+func compactWhitespace(s string) string {
+	re := regexp.MustCompile(`[ \t\r\n]+`)
+	return re.ReplaceAllString(strings.TrimSpace(s), " ")
 }
