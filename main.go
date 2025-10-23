@@ -19,11 +19,11 @@ import (
 
 type VPNWatcher struct {
 	// config
-	IfName         string        // ppp0
-	TargetIP       string        // 10.64.6.42
-	CheckInterval  time.Duration // e.g. 3s
+	IfName         string        // e.g. "ppp0"
+	TargetIP       string        // e.g. "10.64.6.42"
+	CheckInterval  time.Duration // e.g. 3 * time.Second
 	PingTimeoutSec int           // e.g. 2
-	NotifyCooldown time.Duration // e.g. 60s
+	NotifyCooldown time.Duration // e.g. 60 * time.Second
 
 	// telegram
 	TelegramToken   string
@@ -80,7 +80,7 @@ func (w *VPNWatcher) Start() {
 	w.started = true
 	w.mu.Unlock()
 
-	// do first evaluation immediately
+	// first evaluation immediately
 	w.evaluateAndMaybeNotify()
 
 	t := time.NewTicker(w.CheckInterval)
@@ -114,15 +114,35 @@ func (w *VPNWatcher) Status() VPNStatus {
 	}
 }
 
+// evaluate once and notify if changed
 func (w *VPNWatcher) evaluateAndMaybeNotify() {
-	ifPresent, ifUp := checkInterface(w.IfName)
-	viaRoute := routeViaInterface(w.TargetIP, w.IfName)
-	viaPing := false
-	if ifUp {
-		viaPing = pingTargetViaIface(w.TargetIP, w.IfName, w.PingTimeoutSec)
+	changed, newConnected, ifPresent, ifUp, viaRoute, viaPing := w.evaluateCore()
+
+	if changed {
+		if newConnected {
+			w.notify("up", "✅ *FortiVPN Connected* — target reachable")
+		} else {
+			w.notify("down", "❌ *FortiVPN Disconnected* — link or reachability lost")
+		}
 	}
 
-	newConnected := ifUp && viaRoute && viaPing
+	_ = ifPresent // kept via state
+	_ = ifUp      // kept via state
+	_ = viaRoute  // kept via state
+	_ = viaPing   // kept via state
+}
+
+// evaluateCore does the checks and updates state; returns whether state changed and live values
+func (w *VPNWatcher) evaluateCore() (changed bool, newConnected, ifPresent, ifUp, viaRoute, viaPing bool) {
+	ifPresent, ifUp = checkInterface(w.IfName)
+	viaRoute = routeViaInterface(w.TargetIP, w.IfName)
+	if ifUp {
+		viaPing = pingTargetViaIface(w.TargetIP, w.IfName, w.PingTimeoutSec)
+	} else {
+		viaPing = false
+	}
+
+	newConnected = ifUp && viaRoute && viaPing
 
 	w.mu.Lock()
 	prev := w.connected
@@ -131,20 +151,13 @@ func (w *VPNWatcher) evaluateAndMaybeNotify() {
 	w.ifUp = ifUp
 	w.viaRoute = viaRoute
 	w.viaPing = viaPing
-
-	statusChanged := prev != newConnected
-	if statusChanged {
+	changed = prev != newConnected
+	if changed {
 		w.lastChange = time.Now()
 	}
 	w.mu.Unlock()
 
-	if statusChanged {
-		if newConnected {
-			w.notify("up", "✅ *FortiVPN Connected* — target reachable")
-		} else {
-			w.notify("down", "❌ *FortiVPN Disconnected* — link or reachability lost")
-		}
-	}
+	return
 }
 
 func checkInterface(name string) (present, up bool) {
@@ -161,7 +174,7 @@ func checkInterface(name string) (present, up bool) {
 }
 
 func routeViaInterface(targetIP, ifName string) bool {
-	// `ip route get <targetIP>` → look for "dev ppp0"
+	// `ip route get <targetIP>` → must contain ` dev <ifName>`
 	out, err := exec.Command("ip", "route", "get", targetIP).CombinedOutput()
 	if err != nil {
 		return false
@@ -170,7 +183,7 @@ func routeViaInterface(targetIP, ifName string) bool {
 }
 
 func pingTargetViaIface(targetIP, ifName string, timeoutSec int) bool {
-	// Use external ping: Debian iputils-ping supports -c, -W (sec), -I <iface>
+	// Debian iputils-ping supports: -c 1, -W <sec>, -I <iface>
 	cmd := exec.Command("ping", "-c", "1", "-W", fmt.Sprintf("%d", timeoutSec), "-I", ifName, targetIP)
 	if err := cmd.Run(); err != nil {
 		return false
@@ -195,11 +208,19 @@ func (w *VPNWatcher) notify(kind, text string) {
 
 func sendTelegram(token, chatID, text string, markdown bool) error {
 	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	// prevent excessive whitespace/linebreaks
+	// Compact + escape minimal
 	text = compactWhitespace(text)
-
-	form := strings.NewReader(fmt.Sprintf("chat_id=%s&text=%s&parse_mode=%s",
-		urlQueryEscape(chatID), urlQueryEscape(text), ternary(markdown, "Markdown", "")))
+	form := strings.NewReader(fmt.Sprintf(
+		"chat_id=%s&text=%s%s",
+		urlQueryEscape(chatID),
+		urlQueryEscape(text),
+		func() string {
+			if markdown {
+				return "&parse_mode=Markdown"
+			}
+			return ""
+		}(),
+	))
 	req, _ := http.NewRequest("POST", api, form)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
@@ -214,9 +235,8 @@ func sendTelegram(token, chatID, text string, markdown bool) error {
 	return nil
 }
 
-// --- helpers for telegram form ---
 func urlQueryEscape(s string) string {
-	// minimal escape (no external libs)
+	// minimal escaping for form body
 	replacer := strings.NewReplacer(
 		"%", "%25",
 		"&", "%26",
@@ -226,18 +246,17 @@ func urlQueryEscape(s string) string {
 	)
 	return replacer.Replace(s)
 }
-func ternary[T any](cond bool, a, b T) T {
-	if cond {
-		return a
-	}
-	return b
-}
 func compactWhitespace(s string) string {
 	re := regexp.MustCompile(`[ \t\r\n]+`)
 	return re.ReplaceAllString(strings.TrimSpace(s), " ")
 }
 
-// --- HTTP ---
+// ---------- HTTP ----------
+
+func healthHandler(rw http.ResponseWriter, r *http.Request) {
+	rw.Header().Set("Content-Type", "application/json")
+	_, _ = rw.Write([]byte(`{"ok":true}`))
+}
 
 func statusHandler(watcher *VPNWatcher) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
@@ -246,12 +265,65 @@ func statusHandler(watcher *VPNWatcher) http.HandlerFunc {
 		_ = json.NewEncoder(rw).Encode(st)
 	}
 }
-func healthHandler(rw http.ResponseWriter, r *http.Request) {
-	rw.Header().Set("Content-Type", "application/json")
-	_, _ = rw.Write([]byte(`{"ok":true}`))
+
+// Force check: minimal output (per request Mas Putu)
+func forceCheckHandler(watcher *VPNWatcher) http.HandlerFunc {
+	type resp struct {
+		Forced    bool `json:"forced"`
+		Connected bool `json:"connected"`
+	}
+	return func(rw http.ResponseWriter, r *http.Request) {
+		// evaluate immediately and notify if changed
+		_, newConnected, _, _, _, _ := watcher.evaluateCore()
+
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(resp{
+			Forced:    true,
+			Connected: newConnected,
+		})
+	}
 }
 
-// --- main ---
+// Prometheus metrics (no labels)
+func metricsHandler(watcher *VPNWatcher) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		st := watcher.Status()
+
+		// Compose plain text exposition
+		var b strings.Builder
+		b.WriteString("# HELP vpn_up Overall VPN connectivity status (1=up, 0=down)\n")
+		b.WriteString("# TYPE vpn_up gauge\n")
+		b.WriteString(fmt.Sprintf("vpn_up %d\n", boolToInt(st.Connected)))
+
+		b.WriteString("# HELP vpn_interface_up Interface availability (1=up, 0=down)\n")
+		b.WriteString("# TYPE vpn_interface_up gauge\n")
+		b.WriteString(fmt.Sprintf("vpn_interface_up %d\n", boolToInt(st.InterfaceUp)))
+
+		b.WriteString("# HELP vpn_reachable VPN ping reachability (1=up, 0=down)\n")
+		b.WriteString("# TYPE vpn_reachable gauge\n")
+		b.WriteString(fmt.Sprintf("vpn_reachable %d\n", boolToInt(st.ViaPing)))
+
+		b.WriteString("# HELP vpn_route_ok Whether the route to target is via VPN interface (1=ok, 0=not)\n")
+		b.WriteString("# TYPE vpn_route_ok gauge\n")
+		b.WriteString(fmt.Sprintf("vpn_route_ok %d\n", boolToInt(st.ViaRoute)))
+
+		b.WriteString("# HELP vpn_last_change_timestamp Unix timestamp when VPN status last changed\n")
+		b.WriteString("# TYPE vpn_last_change_timestamp gauge\n")
+		b.WriteString(fmt.Sprintf("vpn_last_change_timestamp %d\n", st.LastChange.Unix()))
+
+		rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = rw.Write([]byte(b.String()))
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// ---------- main ----------
 
 func main() {
 	ifName := getenv("FVPN_IFNAME", "ppp0")
@@ -277,9 +349,15 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/vpn/status", statusHandler(w))
+	mux.HandleFunc("/vpn/force-check", forceCheckHandler(w))
+	mux.HandleFunc("/metrics", metricsHandler(w))
 
 	httpAddr := getenv("HTTP_ADDR", ":8080")
-	srv := &http.Server{Addr: httpAddr, Handler: logMiddleware(mux), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           logMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	// graceful shutdown
 	done := make(chan struct{})
@@ -300,7 +378,7 @@ func main() {
 	<-done
 }
 
-// --- utilities ---
+// ---------- utils ----------
 
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -309,12 +387,14 @@ func logMiddleware(next http.Handler) http.Handler {
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
 }
+
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
+
 func getenvDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -324,6 +404,7 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
 func getenvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		var n int
