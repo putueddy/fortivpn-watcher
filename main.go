@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -17,18 +16,45 @@ import (
 	"time"
 )
 
+/* =========  JSON LOGGING  ========= */
+
+type logEntry struct {
+	Level     string         `json:"level"`
+	Message   string         `json:"message"`
+	Timestamp string         `json:"ts"`
+	Fields    map[string]any `json:"fields,omitempty"`
+}
+
+func jsonLog(level, msg string, fields map[string]any) {
+	e := logEntry{
+		Level:     level,
+		Message:   msg,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Fields:    fields,
+	}
+	b, _ := json.Marshal(e)
+	os.Stdout.Write(append(b, '\n'))
+}
+
+/* =========  MODEL  ========= */
+
 type VPNWatcher struct {
 	// config
-	IfName         string        // e.g. "ppp0"
-	TargetIP       string        // e.g. "10.64.6.42"
-	CheckInterval  time.Duration // e.g. 3 * time.Second
-	PingTimeoutSec int           // e.g. 2
-	NotifyCooldown time.Duration // e.g. 60 * time.Second
+	IfName         string
+	TargetIP       string
+	CheckInterval  time.Duration
+	PingTimeoutSec int
+	NotifyCooldown time.Duration
 
 	// telegram
 	TelegramToken   string
 	TelegramChatID  string
 	TelegramEnabled bool
+
+	// autoreconnect
+	AutoReconnect bool
+	ReconnectCmd  string
+	RecheckDelay  time.Duration
 
 	// state
 	mu         sync.RWMutex
@@ -56,6 +82,8 @@ type VPNStatus struct {
 	Since            time.Time `json:"since"`
 }
 
+/* =========  CTOR  ========= */
+
 func NewVPNWatcher(ifName, target string, interval time.Duration) *VPNWatcher {
 	return &VPNWatcher{
 		IfName:          ifName,
@@ -63,11 +91,15 @@ func NewVPNWatcher(ifName, target string, interval time.Duration) *VPNWatcher {
 		CheckInterval:   interval,
 		PingTimeoutSec:  2,
 		NotifyCooldown:  60 * time.Second,
+		RecheckDelay:    5 * time.Second,
+		AutoReconnect:   false,
 		TelegramEnabled: false,
 		lastNotif:       map[string]time.Time{},
 		stopCh:          make(chan struct{}),
 	}
 }
+
+/* =========  CORE LOOP  ========= */
 
 func (w *VPNWatcher) Start() {
 	w.mu.Lock()
@@ -81,7 +113,7 @@ func (w *VPNWatcher) Start() {
 	w.mu.Unlock()
 
 	// first evaluation immediately
-	w.evaluateAndMaybeNotify()
+	w.evaluateAndAct()
 
 	t := time.NewTicker(w.CheckInterval)
 	defer t.Stop()
@@ -89,7 +121,7 @@ func (w *VPNWatcher) Start() {
 	for {
 		select {
 		case <-t.C:
-			w.evaluateAndMaybeNotify()
+			w.evaluateAndAct()
 		case <-w.stopCh:
 			return
 		}
@@ -114,22 +146,40 @@ func (w *VPNWatcher) Status() VPNStatus {
 	}
 }
 
-// evaluate once and notify if changed
-func (w *VPNWatcher) evaluateAndMaybeNotify() {
+/* =========  EVALUATION + ACTIONS  ========= */
+
+func (w *VPNWatcher) evaluateAndAct() {
 	changed, newConnected, ifPresent, ifUp, viaRoute, viaPing := w.evaluateCore()
 
 	if changed {
+		state := "DOWN"
+		if newConnected {
+			state = "UP"
+		}
+		jsonLog("info", "VPN state changed", map[string]any{
+			"state":       state,
+			"interface":   w.IfName,
+			"target_ip":   w.TargetIP,
+			"if_present":  ifPresent,
+			"if_up":       ifUp,
+			"via_route":   viaRoute,
+			"via_ping":    viaPing,
+			"last_change": w.lastChange.Format(time.RFC3339Nano),
+		})
+
+		// Telegram notify
 		if newConnected {
 			w.notify("up", "✅ *FortiVPN Connected* — target reachable")
 		} else {
 			w.notify("down", "❌ *FortiVPN Disconnected* — link or reachability lost")
 		}
-	}
 
-	_ = ifPresent // kept via state
-	_ = ifUp      // kept via state
-	_ = viaRoute  // kept via state
-	_ = viaPing   // kept via state
+		// One-shot AutoReconnect: trigger only on transition Connected -> Disconnected
+		if w.AutoReconnect && !newConnected {
+			// was previous connected? yes, because changed=true and newConnected=false
+			go w.tryAutoReconnectOnce()
+		}
+	}
 }
 
 // evaluateCore does the checks and updates state; returns whether state changed and live values
@@ -159,6 +209,57 @@ func (w *VPNWatcher) evaluateCore() (changed bool, newConnected, ifPresent, ifUp
 
 	return
 }
+
+/* =========  AUTORECONNECT (ONE-SHOT)  ========= */
+
+// notify bypass cooldown (khusus untuk autoreconnect UP)
+func (w *VPNWatcher) notifyBypassCooldown(kind, text string) {
+	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
+		return
+	}
+	w.lastNotif[kind] = time.Now() // langsung update timestamp
+	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
+		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
+	}
+}
+
+func (w *VPNWatcher) tryAutoReconnectOnce() {
+	if w.ReconnectCmd == "" {
+		return
+	}
+	jsonLog("info", "AutoReconnect triggered", map[string]any{
+		"cmd": w.ReconnectCmd,
+	})
+	// run command
+	cmd := exec.Command("bash", "-lc", w.ReconnectCmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		jsonLog("error", "AutoReconnect failed to execute", map[string]any{
+			"error": err.Error(),
+			"out":   string(out),
+		})
+		return
+	}
+	jsonLog("info", "AutoReconnect command executed", map[string]any{
+		"out": string(out),
+	})
+
+	// recheck after delay
+	time.Sleep(w.RecheckDelay)
+	changed, connected, _, _, _, _ := w.evaluateCore()
+	jsonLog("info", "AutoReconnect recheck", map[string]any{
+		"status_changed": changed,
+		"connected":      connected,
+	})
+	if connected {
+		// bypass cooldown agar notif UP tidak ditahan
+		w.notifyBypassCooldown("up", "✅ *FortiVPN Connected* — auto-reconnect succeeded")
+		jsonLog("info", "AutoReconnect success, UP notification sent (bypass cooldown)", nil)
+	}
+
+}
+
+/* =========  CHECKERS  ========= */
 
 func checkInterface(name string) (present, up bool) {
 	ifaces, err := net.Interfaces()
@@ -191,6 +292,8 @@ func pingTargetViaIface(targetIP, ifName string, timeoutSec int) bool {
 	return true
 }
 
+/* =========  TELEGRAM  ========= */
+
 func (w *VPNWatcher) notify(kind, text string) {
 	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
 		return
@@ -202,13 +305,13 @@ func (w *VPNWatcher) notify(kind, text string) {
 	}
 	w.lastNotif[kind] = now
 	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
-		log.Printf("[vpn] telegram error: %v", err)
+		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
 	}
 }
 
 func sendTelegram(token, chatID, text string, markdown bool) error {
 	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	// Compact + escape minimal
+	// compact + escape
 	text = compactWhitespace(text)
 	form := strings.NewReader(fmt.Sprintf(
 		"chat_id=%s&text=%s%s",
@@ -251,7 +354,7 @@ func compactWhitespace(s string) string {
 	return re.ReplaceAllString(strings.TrimSpace(s), " ")
 }
 
-// ---------- HTTP ----------
+/* =========  HTTP  ========= */
 
 func healthHandler(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -266,16 +369,14 @@ func statusHandler(watcher *VPNWatcher) http.HandlerFunc {
 	}
 }
 
-// Force check: minimal output (per request Mas Putu)
+// Force check: minimal output per request Mas Putu
 func forceCheckHandler(watcher *VPNWatcher) http.HandlerFunc {
 	type resp struct {
 		Forced    bool `json:"forced"`
 		Connected bool `json:"connected"`
 	}
 	return func(rw http.ResponseWriter, r *http.Request) {
-		// evaluate immediately and notify if changed
 		_, newConnected, _, _, _, _ := watcher.evaluateCore()
-
 		rw.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(rw).Encode(resp{
 			Forced:    true,
@@ -288,8 +389,6 @@ func forceCheckHandler(watcher *VPNWatcher) http.HandlerFunc {
 func metricsHandler(watcher *VPNWatcher) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
 		st := watcher.Status()
-
-		// Compose plain text exposition
 		var b strings.Builder
 		b.WriteString("# HELP vpn_up Overall VPN connectivity status (1=up, 0=down)\n")
 		b.WriteString("# TYPE vpn_up gauge\n")
@@ -323,7 +422,7 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// ---------- main ----------
+/* =========  SERVER BOOT  ========= */
 
 func main() {
 	ifName := getenv("FVPN_IFNAME", "ppp0")
@@ -331,21 +430,25 @@ func main() {
 	interval := getenvDuration("FVPN_CHECK_INTERVAL", 3*time.Second)
 	pingTimeout := getenvInt("FVPN_PING_TIMEOUT", 2)
 	notifyCooldown := getenvDuration("FVPN_NOTIFY_COOLDOWN", 60*time.Second)
+	recheckDelay := getenvDuration("FVPN_RECHECK_DELAY", 5*time.Second)
 
 	tgToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	tgChatID := os.Getenv("TELEGRAM_CHAT_ID")
+	autoReconnect := strings.ToLower(getenv("FVPN_AUTORECONNECT", "false")) == "true"
+	reconnectCmd := getenv("FVPN_RECONNECT_CMD", "")
 
 	w := NewVPNWatcher(ifName, target, interval)
 	w.PingTimeoutSec = pingTimeout
 	w.NotifyCooldown = notifyCooldown
+	w.RecheckDelay = recheckDelay
 	w.TelegramToken = tgToken
 	w.TelegramChatID = tgChatID
 	w.TelegramEnabled = tgToken != "" && tgChatID != ""
+	w.AutoReconnect = autoReconnect
+	w.ReconnectCmd = reconnectCmd
 
-	// start watcher
 	go w.Start()
 
-	// HTTP
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/vpn/status", statusHandler(w))
@@ -355,9 +458,22 @@ func main() {
 	httpAddr := getenv("HTTP_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:              httpAddr,
-		Handler:           logMiddleware(mux),
+		Handler:           jsonLogMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	// startup log
+	jsonLog("info", "fortivpn watcher starting", map[string]any{
+		"http_addr":       httpAddr,
+		"if_name":         ifName,
+		"target_ip":       target,
+		"check_interval":  interval.String(),
+		"ping_timeout_s":  pingTimeout,
+		"notify_cooldown": notifyCooldown.String(),
+		"autoreconnect":   autoReconnect,
+		"reconnect_cmd":   reconnectCmd,
+		"recheck_delay":   recheckDelay.String(),
+	})
 
 	// graceful shutdown
 	done := make(chan struct{})
@@ -365,26 +481,31 @@ func main() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
-		log.Println("shutting down...")
+		jsonLog("info", "shutting down", nil)
 		_ = srv.Close()
 		w.Stop()
 		close(done)
 	}()
 
-	log.Printf("fortivpn watcher on %s (if=%s, target=%s)", httpAddr, ifName, target)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+		jsonLog("fatal", "server error", map[string]any{"error": err.Error()})
+		os.Exit(1)
 	}
 	<-done
 }
 
-// ---------- utils ----------
+/* =========  UTILS  ========= */
 
-func logMiddleware(next http.Handler) http.Handler {
+func jsonLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(rw, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+		jsonLog("access", "http request", map[string]any{
+			"method":  r.Method,
+			"path":    r.URL.Path,
+			"latency": time.Since(start).String(),
+			"remote":  r.RemoteAddr,
+		})
 	})
 }
 
@@ -400,7 +521,7 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		log.Printf("invalid duration %s=%q, using %s", key, v, def)
+		jsonLog("warn", "invalid duration env, using default", map[string]any{key: v, "default": def.String()})
 	}
 	return def
 }
@@ -411,7 +532,7 @@ func getenvInt(key string, def int) int {
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
 			return n
 		}
-		log.Printf("invalid int %s=%q, using %d", key, v, def)
+		jsonLog("warn", "invalid int env, using default", map[string]any{key: v, "default": def})
 	}
 	return def
 }
