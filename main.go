@@ -212,6 +212,20 @@ func (w *VPNWatcher) evaluateCore() (changed bool, newConnected, ifPresent, ifUp
 	return
 }
 
+// checkConnectivity performs connectivity check without updating state (read-only)
+func (w *VPNWatcher) checkConnectivity() bool {
+	ifPresent, ifUp := checkInterface(w.IfName)
+	if !ifPresent || !ifUp {
+		return false
+	}
+	viaRoute := routeViaInterface(w.TargetIP, w.IfName)
+	if !viaRoute {
+		return false
+	}
+	viaPing := pingTargetViaIface(w.TargetIP, w.IfName, w.PingTimeoutSec)
+	return viaPing
+}
+
 /* =========  AUTORECONNECT (ONE-SHOT)  ========= */
 
 func (w *VPNWatcher) tryAutoReconnectOnce() {
@@ -235,17 +249,31 @@ func (w *VPNWatcher) tryAutoReconnectOnce() {
 		"out": string(out),
 	})
 
-	// recheck after delay
+	// recheck after delay (read-only check to avoid duplicate state change)
 	time.Sleep(w.RecheckDelay)
-	_, connected, _, _, _, _ := w.evaluateCore()
+	connected := w.checkConnectivity()
 	jsonLog("info", "AutoReconnect recheck", map[string]any{
 		"connected": connected,
 	})
 
 	if connected {
-		// bypass cooldown agar notif UP tidak ditahan
+		// bypass cooldown and send custom message
 		w.notifyWithOptions("up", "✅ *FortiVPN Connected* — auto-reconnect succeeded", true, "auto-reconnect succeeded")
 		jsonLog("info", "AutoReconnect success, UP notification sent (bypass cooldown)", nil)
+
+		// Update state manually to reflect the reconnection (prevents duplicate notification on next tick)
+		ifPresent, ifUp := checkInterface(w.IfName)
+		viaRoute := routeViaInterface(w.TargetIP, w.IfName)
+		viaPing := pingTargetViaIface(w.TargetIP, w.IfName, w.PingTimeoutSec)
+
+		w.mu.Lock()
+		w.connected = true
+		w.ifPresent = ifPresent
+		w.ifUp = ifUp
+		w.viaRoute = viaRoute
+		w.viaPing = viaPing
+		w.lastChange = time.Now()
+		w.mu.Unlock()
 	}
 }
 
@@ -286,11 +314,6 @@ func pingTargetViaIface(targetIP, ifName string, timeoutSec int) bool {
 
 func (w *VPNWatcher) notify(kind, text string) {
 	w.notifyWithOptions(kind, text, false, "")
-}
-
-// notify bypass cooldown (khusus untuk autoreconnect UP)
-func (w *VPNWatcher) notifyBypassCooldown(kind, text string) {
-	w.notifyWithOptions(kind, text, true, "")
 }
 
 // notifyWithOptions handles both Telegram and Teams notifications with optional cooldown bypass and custom message
