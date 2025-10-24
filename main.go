@@ -170,15 +170,12 @@ func (w *VPNWatcher) evaluateAndAct() {
 			"last_change": w.lastChange.Format(time.RFC3339Nano),
 		})
 
-		// Telegram notify (cooldown)
+		// Unified notification (Telegram + Teams)
 		if newConnected {
 			w.notify("up", "✅ *FortiVPN Connected* — target reachable")
 		} else {
 			w.notify("down", "❌ *FortiVPN Disconnected* — link or reachability lost")
 		}
-
-		// Teams Adaptive Card (tanpa cooldown)
-		w.notifyTeamsAdaptive(newConnected, "")
 
 		// One-shot AutoReconnect: trigger only on transition Connected -> Disconnected
 		if w.AutoReconnect && !newConnected {
@@ -247,10 +244,8 @@ func (w *VPNWatcher) tryAutoReconnectOnce() {
 
 	if connected {
 		// bypass cooldown agar notif UP tidak ditahan
-		w.notifyBypassCooldown("up", "✅ *FortiVPN Connected* — auto-reconnect succeeded")
+		w.notifyWithOptions("up", "✅ *FortiVPN Connected* — auto-reconnect succeeded", true, "auto-reconnect succeeded")
 		jsonLog("info", "AutoReconnect success, UP notification sent (bypass cooldown)", nil)
-		// kirim juga Teams Adaptive Card dengan pesan custom
-		w.notifyTeamsAdaptive(true, "auto-reconnect succeeded")
 	}
 }
 
@@ -287,31 +282,53 @@ func pingTargetViaIface(targetIP, ifName string, timeoutSec int) bool {
 	return true
 }
 
-/* =========  TELEGRAM  ========= */
+/* =========  NOTIFICATIONS (TELEGRAM + TEAMS)  ========= */
 
 func (w *VPNWatcher) notify(kind, text string) {
-	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
-		return
-	}
-	now := time.Now()
-	last := w.lastNotif[kind]
-	if now.Sub(last) < w.NotifyCooldown {
-		return
-	}
-	w.lastNotif[kind] = now
-	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
-		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
-	}
+	w.notifyWithOptions(kind, text, false, "")
 }
 
 // notify bypass cooldown (khusus untuk autoreconnect UP)
 func (w *VPNWatcher) notifyBypassCooldown(kind, text string) {
-	if !w.TelegramEnabled || w.TelegramToken == "" || w.TelegramChatID == "" {
+	w.notifyWithOptions(kind, text, true, "")
+}
+
+// notifyWithOptions handles both Telegram and Teams notifications with optional cooldown bypass and custom message
+func (w *VPNWatcher) notifyWithOptions(kind, text string, bypassCooldown bool, customMessage string) {
+	connected := kind == "up"
+
+	// Check cooldown (applies to both Telegram and Teams)
+	shouldNotify := true
+	if !bypassCooldown {
+		now := time.Now()
+		last := w.lastNotif[kind]
+		if now.Sub(last) < w.NotifyCooldown {
+			shouldNotify = false
+		} else {
+			w.lastNotif[kind] = now
+		}
+	} else {
+		w.lastNotif[kind] = time.Now()
+	}
+
+	if !shouldNotify {
 		return
 	}
-	w.lastNotif[kind] = time.Now() // set timestamp agar tetap terlacak
-	if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
-		jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
+
+	// Telegram notification
+	if w.TelegramEnabled && w.TelegramToken != "" && w.TelegramChatID != "" {
+		if err := sendTelegram(w.TelegramToken, w.TelegramChatID, text, true); err != nil {
+			jsonLog("error", "telegram notify error", map[string]any{"error": err.Error()})
+		}
+	}
+
+	// Teams notification
+	if w.TeamsWebhookURL != "" {
+		status := "DOWN"
+		if connected {
+			status = "UP"
+		}
+		sendTeamsAdaptiveCard(w.TeamsWebhookURL, status, time.Now().Format("2006-01-02 15:04:05"), customMessage)
 	}
 }
 
@@ -346,53 +363,32 @@ func sendTelegram(token, chatID, text string, markdown bool) error {
 
 /* =========  TEAMS (ADAPTIVE CARD via Workflow URL)  ========= */
 
-func (w *VPNWatcher) notifyTeamsAdaptive(connected bool, customMessage string) {
-	if w.TeamsWebhookURL == "" {
+func sendTeamsAdaptiveCard(webhook, status, timestamp, customMessage string) {
+	// Build payload matching Power Automate workflow schema
+	// The workflow expects: { "status": "UP/DOWN", "time": "timestamp" }
+	payload := map[string]string{
+		"status": status,
+		"time":   timestamp,
+	}
+
+	// Add custom message if provided (optional field)
+	if customMessage != "" {
+		payload["message"] = customMessage
+	} else {
+		if status == "UP" {
+			payload["message"] = "target reachable"
+		} else {
+			payload["message"] = "link or reachability lost"
+		}
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		jsonLog("error", "Teams payload marshal failed", map[string]any{"error": err.Error()})
 		return
 	}
-	status := "DOWN"
-	if connected {
-		status = "UP"
-	}
-	sendTeamsAdaptiveCard(w.TeamsWebhookURL, status, time.Now().Format("2006-01-02 15:04:05"), customMessage)
-}
 
-func sendTeamsAdaptiveCard(webhook, status, timestamp, customMessage string) {
-	// Build Adaptive Card with A + C choices
-	title := "🔥 FortiVPN Disconnected — link or reachability lost"
-	color := "Attention"
-	if status == "UP" {
-		title = "✅ FortiVPN Connected  — target reachable"
-		if customMessage != "" {
-			title = "✅ FortiVPN Connected — " + customMessage
-		}
-		color = "Good"
-	}
-	card := fmt.Sprintf(`{
-		"type": "AdaptiveCard",
-		"version": "1.4",
-		"body": [
-			{
-				"type": "TextBlock",
-				"text": "%s",
-				"size": "Large",
-				"weight": "Bolder",
-				"color": "%s"
-			},
-			{
-				"type": "TextBlock",
-				"text": "**Status:** %s",
-				"wrap": true
-			},
-			{
-				"type": "TextBlock",
-				"text": "**Time:** %s",
-				"wrap": true
-			}
-		]
-	}`, title, color, status, timestamp)
-
-	req, _ := http.NewRequest("POST", webhook, strings.NewReader(card))
+	req, _ := http.NewRequest("POST", webhook, strings.NewReader(string(payloadJSON)))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
